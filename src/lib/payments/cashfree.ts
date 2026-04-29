@@ -131,11 +131,8 @@ export async function getOrderStatus(orderId: string): Promise<CashfreePaymentSt
  */
 export function verifyWebhookSignature(rawBody: string, signature: string): boolean {
   if (!CF_WEBHOOK_SECRET) {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('[Cashfree] CRITICAL: Webhook secret not configured in production');
-    }
-    console.warn('[Cashfree] No webhook secret configured — skipping verification (dev only)');
-    return true;
+    console.error('[Cashfree] CRITICAL: CASHFREE_WEBHOOK_SECRET not configured');
+    return false;
   }
 
   const expectedSignature = crypto
