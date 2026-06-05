@@ -225,6 +225,24 @@ async function tryModel(
         continue;
       }
 
+      // Check for mostly-black images (failed generation)
+      // Sample ~200 bytes from the middle of the image data
+      const sampleStart = Math.floor(buf.byteLength * 0.3);
+      const sampleEnd = Math.min(sampleStart + 200, buf.byteLength);
+      let darkPixels = 0;
+      let totalSampled = 0;
+      for (let i = sampleStart; i < sampleEnd; i++) {
+        totalSampled++;
+        if (buf[i] < 15) darkPixels++;
+      }
+      const darkRatio = totalSampled > 0 ? darkPixels / totalSampled : 0;
+      if (darkRatio > 0.85) {
+        console.warn(
+          `[NvidiaNIM] ${model.id}: image appears mostly black (${(darkRatio * 100).toFixed(0)}% dark) — retrying`,
+        );
+        continue;
+      }
+
       console.log(
         `[NvidiaNIM] ✅ ${model.id} success — ${buf.byteLength} bytes`,
       );

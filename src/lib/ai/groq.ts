@@ -18,7 +18,7 @@ const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 // ---------------------------------------------------------------------------
 
 const EXPRESSION_BOOST =
-  'extremely expressive face, exaggerated emotional reaction, wide eyes, dramatic jaw drop or excited smile, intense gaze, over-the-top facial expression';
+  'extremely expressive face, intense emotion, dramatic expression';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -71,69 +71,58 @@ export async function generateCTRVariants(
   const systemPrompt = `You are a world-class YouTube thumbnail designer and CTR optimization expert.
 Given a video title, style, and platform, generate EXACTLY ${count} DISTINCT thumbnail variant plans.
 
-Each variant MUST have a meaningfully DIFFERENT visual concept — not just slight wording changes.
+Each variant MUST have a meaningfully DIFFERENT visual concept.
 
-ABSOLUTE RULES (violation = failure):
+ABSOLUTE RULES:
 
-1. SPELLING: All text overlays must have PERFECT spelling. Double-check every single word. Copy key words EXACTLY from the video title. NO TYPOS ALLOWED.
+1. IMAGE PROMPT LENGTH: Image prompts MUST be under 350 characters total. Be concise and descriptive. Quality over quantity.
 
-2. IMAGE PHOTOREALISM: Image prompts MUST produce photorealistic results, NOT AI-looking images. Include these in EVERY prompt:
-   - "shot on Canon EOS R5, 35mm lens, natural lighting"
-   - Describe realistic environments (real office, real kitchen, real street)
-   - For people: specify natural skin texture, realistic hair, authentic clothing
-   - NEVER use: "3D render", "cartoon", "illustration", "digital art", "fantasy"
+2. PROMPT STYLE: Write short, comma-separated visual descriptions. Example:
+   "close-up of a man looking shocked at laptop screen, dramatic side lighting, dark room, cinematic, 4k photo"
+   NOT long paragraphs with camera specs.
 
-3. NO TEXT IN IMAGES: NEVER include text, words, letters, numbers, logos, watermarks, or any written content in the image prompt. Text is overlaid separately.
+3. NO TEXT IN IMAGES: NEVER include text, words, letters, numbers, logos in the image prompt.
 
-4. EXPRESSION: For image prompts with a person, include: ${EXPRESSION_BOOST}
+4. EXPRESSION: For prompts with a person: "expressive face, intense emotion"
 
-5. TEXT LENGTH: Primary = 2-3 words MAXIMUM. Secondary = 3-5 words MAXIMUM. The shorter and punchier, the better.
+5. TEXT LENGTH: Primary = 2-3 words MAX. Secondary = 3-5 words MAX.
 
-6. TEXT CONTENT: Extract the most powerful words directly FROM the title. Always keep the exact words from the title.
+6. TEXT CONTENT: Extract the most powerful words directly FROM the title.
    Examples:
    - Title "I Built a $1M App" → primary: "$1M APP", secondary: "Built From Scratch"
    - Title "This AI Tool Changed Everything" → primary: "GAME CHANGER", secondary: "The AI Tool You Need"
-   - Title "Learn Python in 30 Days" → primary: "30 DAYS", secondary: "Python Mastery"
 
-7. COLORS: Use HIGH CONTRAST. Choose from these proven combos:
-   - White text (#FFFFFF) on dark bg (#000000) — classic, always works
-   - Yellow text (#FFE500) on dark bg (#1a1a2e) — attention-grabbing
-   - Red accent (#FF3333) with white primary — urgency
+7. COLORS: Use HIGH CONTRAST proven combos:
+   - White (#FFFFFF) on dark (#000000)
+   - Yellow (#FFE500) on dark (#1a1a2e)
+   - Red accent (#FF3333) with white primary
 
-8. LAYOUT: Each variant MUST use a DIFFERENT layout from the 4 options.
+8. LAYOUT: Each variant MUST use a DIFFERENT layout.
 
-9. NEGATIVE PROMPT: Always include: "text, watermark, logo, blurry, oversaturated, artificial looking, plastic skin, 3d render, cartoon, anime, painting"
+9. NEGATIVE PROMPT: Keep short: "text, watermark, blurry, cartoon, anime, 3d render"
 
-Respond ONLY with valid JSON matching this schema:
+Respond ONLY with valid JSON:
 {
   "variants": [
     {
-      "imagePrompt": "A photorealistic scene description, shot on Canon EOS R5, 35mm lens, natural lighting...",
-      "negativePrompt": "text, watermark, logo, blurry, oversaturated, artificial, plastic skin, 3d render...",
-      "textOverlays": {
-        "primary": "2-3 WORDS",
-        "secondary": "3-5 words"
-      },
+      "imagePrompt": "short vivid scene, comma separated descriptors, max 350 chars",
+      "negativePrompt": "text, watermark, blurry, cartoon",
+      "textOverlays": { "primary": "2-3 WORDS", "secondary": "3-5 words" },
       "layout": "face-left-text-right" | "center-subject-top-text" | "full-text-overlay" | "split-screen",
-      "colors": {
-        "primary": "#FFFFFF",
-        "accent": "#FFE500",
-        "background": "#000000"
-      }
+      "colors": { "primary": "#FFFFFF", "accent": "#FFE500", "background": "#000000" }
     }
   ]
 }
 
-DO NOT include an "emoji" field. Emoji rendering is not supported.`;
+DO NOT include an "emoji" field.`;
 
   const userMessage = `Title: "${title}"
-Style: ${style} (${preset.promptSuffix})
+Style: ${style}
 Platform: ${platform}
 Variants needed: ${count}
 
-CRITICAL: Copy key words from the title EXACTLY as spelled — no typos, no abbreviations.
-Make the image prompts describe a REAL photograph, not AI art.
-Create ${count} DISTINCT, scroll-stopping thumbnail concepts.`;
+IMPORTANT: Keep image prompts SHORT (under 350 chars). Describe the SCENE vividly but concisely.
+Create ${count} DISTINCT, scroll-stopping concepts.`;
 
   try {
     const response = await fetch(GROQ_API_URL, {
@@ -246,8 +235,10 @@ function validateLayout(layout: string): LayoutType | null {
   return VALID_LAYOUTS.includes(layout as LayoutType) ? (layout as LayoutType) : null;
 }
 
-function injectExpressionBoost(prompt: string, styleSuffix: string): string {
-  return `${prompt}, ${EXPRESSION_BOOST}, ${styleSuffix}, shot on Canon EOS R5, 35mm lens, DSLR photograph, natural skin texture, realistic lighting, shallow depth of field, no text, no watermark, no logo`;
+function injectExpressionBoost(prompt: string, _styleSuffix: string): string {
+  // Keep prompts concise for FLUX models (max ~700 chars before truncation)
+  const boost = `${prompt}, ${EXPRESSION_BOOST}, cinematic lighting, 4k photograph, no text, no watermark`;
+  return boost.length > 700 ? boost.substring(0, 700) : boost;
 }
 
 function extractKeyPhrases(title: string): string[] {
