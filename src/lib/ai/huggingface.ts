@@ -1,17 +1,18 @@
 /**
- * Pollinations.ai image generation — free with API key.
+ * Image generation module — NVIDIA NIM (primary) + Pollinations.ai (fallback).
  *
- * Uses TWO methods (with automatic fallback):
- *   1. POST /v1/images/generations (OpenAI-compatible, returns URL → fetch image)
- *   2. GET  /image/{prompt}?key=... (direct image response, fallback)
+ * Provider priority:
+ *   1. NVIDIA NIM API Catalog (free tier, 40 RPM)
+ *      - black-forest-labs/flux.2-klein-4b
+ *      - stabilityai/stable-diffusion-3-5-large (fallback model)
+ *   2. Pollinations.ai GET endpoint (free, last resort)
  *
- * Model priority: flux → zimage
- *
- * Get your free API key at: https://enter.pollinations.ai
+ * NVIDIA NIM API key: https://build.nvidia.com → Get API Key (nvapi-...)
+ * Pollinations key:   https://enter.pollinations.ai
  */
 
 // ---------------------------------------------------------------------------
-// Public types (unchanged API)
+// Public types (unchanged API — pipeline.ts imports these)
 // ---------------------------------------------------------------------------
 
 export interface GenerateImageOptions {
@@ -34,50 +35,80 @@ export interface GeneratedImage {
 
 const REQUEST_TIMEOUT = 120_000;
 const MAX_RETRIES = 2;
+
+/** NVIDIA NIM models in priority order */
+const NVIDIA_MODELS = [
+  'black-forest-labs/flux.2-klein-4b',
+  'stabilityai/stable-diffusion-3-5-large',
+] as const;
+
+/** Pollinations models (fallback only) */
 const POLLINATIONS_MODELS = ['flux', 'zimage'] as const;
 
 // ---------------------------------------------------------------------------
-// Method 1: POST /v1/images/generations (OpenAI-compatible)
-// Returns a URL that we then fetch to get the actual image bytes.
+// NVIDIA NIM — Primary Provider
 // ---------------------------------------------------------------------------
 
-async function tryPost(
+/**
+ * NVIDIA NIM API Catalog — text-to-image generation.
+ *
+ * Endpoint: POST https://ai.api.nvidia.com/v1/genai/{model}
+ * Auth:     Bearer nvapi-...
+ * Response: { artifacts: [{ base64: "...", finishReason: "SUCCESS" }] }
+ */
+async function tryNvidiaNim(
   options: GenerateImageOptions,
   model: string,
 ): Promise<GeneratedImage | null> {
-  const { prompt, negativePrompt, width, height } = options;
-  const w = clampSize(width);
-  const h = clampSize(height);
+  const apiKey = process.env.NVIDIA_NIM_API_KEY;
+  if (!apiKey) {
+    console.warn('[NvidiaNIM] NVIDIA_NIM_API_KEY not set — skipping');
+    return null;
+  }
+
+  const { prompt, negativePrompt, guidanceScale, inferenceSteps } = options;
+
+  // Build text_prompts array (positive + optional negative)
+  const textPrompts: Array<{ text: string; weight: number }> = [
+    { text: prompt, weight: 1 },
+  ];
+  if (negativePrompt) {
+    textPrompts.push({ text: negativePrompt, weight: -1 });
+  }
+
+  const cfgScale = guidanceScale ?? 5;
+  const steps = inferenceSteps ?? 25;
   const seed = randomSeed();
-  const apiKey = process.env.POLLINATIONS_API_KEY;
 
-  if (!apiKey) return null; // POST requires auth
+  const url = `https://ai.api.nvidia.com/v1/genai/${model}`;
 
-  let fullPrompt = prompt;
-  if (negativePrompt) fullPrompt += `\n\nNegative: ${negativePrompt}`;
-
-  console.log(`[Pollinations] POST model="${model}" ${w}x${h} seed=${seed}`);
+  console.log(
+    `[NvidiaNIM] POST model="${model}" cfg=${cfgScale} steps=${steps} seed=${seed}`,
+  );
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      console.log(`[Pollinations] POST ${model} attempt ${attempt + 1}/${MAX_RETRIES}`);
+      console.log(
+        `[NvidiaNIM] ${model} attempt ${attempt + 1}/${MAX_RETRIES}`,
+      );
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-      const res = await fetch('https://gen.pollinations.ai/v1/images/generations', {
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          prompt: fullPrompt,
-          model,
-          n: 1,
-          size: `${w}x${h}`,
-          response_format: 'url',
+          text_prompts: textPrompts,
+          cfg_scale: cfgScale,
+          steps,
           seed,
+          sampler: 'K_DPM_2_ANCESTRAL',
+          samples: 1,
         }),
         signal: controller.signal,
       });
@@ -85,52 +116,69 @@ async function tryPost(
 
       if (!res.ok) {
         const errText = await res.text().catch(() => '');
-        console.warn(`[Pollinations] POST ${model} HTTP ${res.status}: ${errText.substring(0, 300)}`);
-        if ([401, 402, 403].includes(res.status)) return null; // fatal
-        if (res.status === 429) { await sleep(10000); continue; }
-        if (res.status >= 500) { await sleep(5000); continue; }
+        console.warn(
+          `[NvidiaNIM] ${model} HTTP ${res.status}: ${errText.substring(0, 400)}`,
+        );
+
+        // Fatal auth errors — stop trying this model
+        if ([401, 403].includes(res.status)) return null;
+
+        // Rate limited — wait and retry
+        if (res.status === 429) {
+          const retryAfter = parseInt(res.headers.get('retry-after') || '10', 10);
+          console.warn(`[NvidiaNIM] Rate limited, waiting ${retryAfter}s...`);
+          await sleep(retryAfter * 1000);
+          continue;
+        }
+
+        // Server error — retry after brief wait
+        if (res.status >= 500) {
+          await sleep(5000);
+          continue;
+        }
+
         return null;
       }
 
-      // Parse the JSON response
-      const json = await res.json() as {
-        data?: Array<{ url?: string; b64_json?: string }>;
+      // Parse response: { artifacts: [{ base64: "...", finishReason: "SUCCESS" }] }
+      const json = (await res.json()) as {
+        artifacts?: Array<{
+          base64?: string;
+          finishReason?: string;
+          seed?: number;
+        }>;
       };
 
-      const entry = json?.data?.[0];
-      if (!entry) {
-        console.warn(`[Pollinations] POST ${model}: empty data array`);
+      const artifact = json?.artifacts?.[0];
+      if (!artifact?.base64) {
+        console.warn(
+          `[NvidiaNIM] ${model}: no base64 in response (finishReason=${artifact?.finishReason || 'unknown'})`,
+        );
+
+        // CONTENT_FILTERED means the prompt was flagged — don't retry
+        if (artifact?.finishReason === 'CONTENT_FILTERED') {
+          console.warn(`[NvidiaNIM] ${model}: content filtered by safety`);
+          return null;
+        }
+
         continue;
       }
 
-      // --- Handle URL response ---
-      if (entry.url) {
-        // The returned URL also requires auth — append ?key= if missing
-        let imgUrl = entry.url;
-        if (apiKey && !imgUrl.includes('key=')) {
-          imgUrl += (imgUrl.includes('?') ? '&' : '?') + `key=${apiKey}`;
-        }
-        console.log(`[Pollinations] POST ${model}: got URL, fetching image...`);
-        const imgBuf = await fetchImageFromUrl(imgUrl);
-        if (imgBuf) return imgBuf;
-        console.warn(`[Pollinations] POST ${model}: could not fetch image from URL`);
+      // Decode base64 → Buffer
+      const buf = Buffer.from(artifact.base64, 'base64');
+      if (buf.byteLength < 500) {
+        console.warn(
+          `[NvidiaNIM] ${model}: decoded image too small (${buf.byteLength} bytes)`,
+        );
         continue;
       }
 
-      // --- Handle b64_json response ---
-      if (entry.b64_json) {
-        const buf = Buffer.from(entry.b64_json, 'base64');
-        if (buf.byteLength < 500) {
-          console.warn(`[Pollinations] POST ${model}: b64 image too small`);
-          continue;
-        }
-        console.log(`[Pollinations] ✅ POST ${model} success — ${buf.byteLength} bytes`);
-        return { buffer: buf, contentType: detectType(buf) };
-      }
-
-      console.warn(`[Pollinations] POST ${model}: no url or b64_json in response`);
+      console.log(
+        `[NvidiaNIM] ✅ ${model} success — ${buf.byteLength} bytes (seed=${artifact.seed || seed})`,
+      );
+      return { buffer: buf, contentType: detectType(buf) };
     } catch (err) {
-      logError('POST', model, err);
+      logError('NvidiaNIM', model, err);
       if (attempt < MAX_RETRIES - 1) await sleep(3000);
     }
   }
@@ -139,11 +187,14 @@ async function tryPost(
 }
 
 // ---------------------------------------------------------------------------
-// Method 2: GET /image/{prompt}?key=... (direct binary image)
-// Key MUST be passed as ?key= query param, NOT in Authorization header.
+// Pollinations.ai — Fallback Provider
 // ---------------------------------------------------------------------------
 
-async function tryGet(
+/**
+ * Pollinations GET endpoint — direct binary image response.
+ * Works with or without API key.
+ */
+async function tryPollinationsGet(
   options: GenerateImageOptions,
   model: string,
 ): Promise<GeneratedImage | null> {
@@ -153,20 +204,22 @@ async function tryGet(
   const seed = randomSeed();
   const apiKey = process.env.POLLINATIONS_API_KEY;
 
-  // Truncate for URL safety
-  const safePrompt = prompt.length > 1500 ? prompt.substring(0, 1500) : prompt;
+  const safePrompt =
+    prompt.length > 1500 ? prompt.substring(0, 1500) : prompt;
   const encoded = encodeURIComponent(safePrompt);
 
-  // Build URL — key goes as query param!
   let url = `https://gen.pollinations.ai/image/${encoded}?model=${model}&width=${w}&height=${h}&seed=${seed}&nologo=true`;
-  if (negativePrompt) url += `&negative_prompt=${encodeURIComponent(negativePrompt)}`;
+  if (negativePrompt)
+    url += `&negative_prompt=${encodeURIComponent(negativePrompt)}`;
   if (apiKey) url += `&key=${apiKey}`;
 
   console.log(`[Pollinations] GET model="${model}" ${w}x${h} seed=${seed}`);
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      console.log(`[Pollinations] GET ${model} attempt ${attempt + 1}/${MAX_RETRIES}`);
+      console.log(
+        `[Pollinations] GET ${model} attempt ${attempt + 1}/${MAX_RETRIES}`,
+      );
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
@@ -179,34 +232,47 @@ async function tryGet(
 
       if (!res.ok) {
         const errText = await res.text().catch(() => '');
-        console.warn(`[Pollinations] GET ${model} HTTP ${res.status}: ${errText.substring(0, 300)}`);
+        console.warn(
+          `[Pollinations] GET ${model} HTTP ${res.status}: ${errText.substring(0, 300)}`,
+        );
         if ([401, 402, 403].includes(res.status)) return null;
-        if (res.status === 429) { await sleep(10000); continue; }
-        if (res.status >= 500) { await sleep(5000); continue; }
+        if (res.status === 429) {
+          await sleep(10000);
+          continue;
+        }
+        if (res.status >= 500) {
+          await sleep(5000);
+          continue;
+        }
         return null;
       }
 
-      // Check content type — must be image, not JSON error
       const ct = res.headers.get('content-type') || '';
       if (ct.includes('application/json') || ct.includes('text/')) {
         const text = await res.text();
-        console.warn(`[Pollinations] GET ${model}: got ${ct} instead of image: ${text.substring(0, 300)}`);
+        console.warn(
+          `[Pollinations] GET ${model}: got ${ct} instead of image: ${text.substring(0, 300)}`,
+        );
         continue;
       }
 
       const arrayBuf = await res.arrayBuffer();
       if (arrayBuf.byteLength < 500) {
-        console.warn(`[Pollinations] GET ${model}: image too small (${arrayBuf.byteLength} bytes)`);
+        console.warn(
+          `[Pollinations] GET ${model}: image too small (${arrayBuf.byteLength} bytes)`,
+        );
         continue;
       }
 
       const buf = Buffer.from(arrayBuf);
       const contentType = ct.includes('image/') ? ct : detectType(buf);
 
-      console.log(`[Pollinations] ✅ GET ${model} success — ${buf.byteLength} bytes, ${contentType}`);
+      console.log(
+        `[Pollinations] ✅ GET ${model} success — ${buf.byteLength} bytes, ${contentType}`,
+      );
       return { buffer: buf, contentType };
     } catch (err) {
-      logError('GET', model, err);
+      logError('Pollinations-GET', model, err);
       if (attempt < MAX_RETRIES - 1) await sleep(3000);
     }
   }
@@ -219,43 +285,45 @@ async function tryGet(
 // ---------------------------------------------------------------------------
 
 /**
- * Generate a single image using Pollinations.ai.
+ * Generate a single image.
  *
  * Strategy:
- *   1. Try POST endpoint with each model (flux → zimage)
- *   2. Fallback to GET endpoint with each model
+ *   1. NVIDIA NIM: SDXL → SD 3.5 Large
+ *   2. Pollinations GET: flux → zimage (fallback)
  */
 export async function generateImage(
   options: GenerateImageOptions,
 ): Promise<GeneratedImage> {
-  console.log(`[ImageGen] "${options.prompt.substring(0, 60)}..." (${options.width}×${options.height})`);
-  const apiKey = process.env.POLLINATIONS_API_KEY;
+  console.log(
+    `[ImageGen] "${options.prompt.substring(0, 60)}..." (${options.width}×${options.height})`,
+  );
 
-  // GET endpoint is primary — proven reliable from production logs
+  // ── Provider 1: NVIDIA NIM (primary) ────────────────────────────────
+  if (process.env.NVIDIA_NIM_API_KEY) {
+    for (const model of NVIDIA_MODELS) {
+      const result = await tryNvidiaNim(options, model);
+      if (result) return result;
+    }
+    console.warn('[ImageGen] All NVIDIA NIM models failed, trying Pollinations fallback...');
+  } else {
+    console.warn('[ImageGen] NVIDIA_NIM_API_KEY not set, trying Pollinations...');
+  }
+
+  // ── Provider 2: Pollinations GET (fallback) ─────────────────────────
   for (const model of POLLINATIONS_MODELS) {
-    const result = await tryGet(options, model);
+    const result = await tryPollinationsGet(options, model);
     if (result) return result;
   }
 
-  // Fallback: POST endpoint (OpenAI-compatible)
-  if (apiKey) {
-    console.log('[ImageGen] GET failed, trying POST endpoint...');
-    for (const model of POLLINATIONS_MODELS) {
-      const result = await tryPost(options, model);
-      if (result) return result;
-    }
-  }
-
   throw new Error(
-    'Image generation failed.\n\n' +
-    'Possible causes:\n' +
-    '  • Pollen credits depleted (refills hourly)\n' +
-    '  • API key may be invalid\n' +
-    '  • Pollinations.ai may be down\n\n' +
+    'Image generation failed — all providers exhausted.\n\n' +
+    'Tried:\n' +
+    '  1. NVIDIA NIM (SDXL, SD 3.5 Large)\n' +
+    '  2. Pollinations.ai (flux, zimage)\n\n' +
     'Solutions:\n' +
-    '  1. Wait a few minutes and try again\n' +
-    '  2. Check your key at https://enter.pollinations.ai\n' +
-    '  3. Set POLLINATIONS_API_KEY in your .env.local'
+    '  • Set NVIDIA_NIM_API_KEY from https://build.nvidia.com\n' +
+    '  • Set POLLINATIONS_API_KEY from https://enter.pollinations.ai\n' +
+    '  • Wait a few minutes and retry (rate limits refill)',
   );
 }
 
@@ -273,11 +341,16 @@ export async function generateMultipleImages(
 
   for (let i = 0; i < count; i++) {
     const prompt = variantPrompts?.[i] || baseOptions.prompt;
-    const negativePrompt = variantNegatives?.[i] || baseOptions.negativePrompt;
+    const negativePrompt =
+      variantNegatives?.[i] || baseOptions.negativePrompt;
 
     try {
       console.log(`[Pipeline] Generating variant ${i + 1}/${count}...`);
-      const image = await generateImage({ ...baseOptions, prompt, negativePrompt });
+      const image = await generateImage({
+        ...baseOptions,
+        prompt,
+        negativePrompt,
+      });
       results.push(image);
       if (i < count - 1) await sleep(2000);
     } catch (error) {
@@ -299,46 +372,6 @@ export async function generateMultipleImages(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Fetch an image from a URL and return as GeneratedImage */
-async function fetchImageFromUrl(imageUrl: string): Promise<GeneratedImage | null> {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60_000);
-
-    const res = await fetch(imageUrl, { signal: controller.signal, redirect: 'follow' });
-    clearTimeout(timer);
-
-    if (!res.ok) {
-      console.warn(`[Fetch] Image URL returned ${res.status}`);
-      return null;
-    }
-
-    const ct = res.headers.get('content-type') || '';
-
-    // If the URL returns JSON or text, it's not an image
-    if (ct.includes('json') || ct.includes('text/html')) {
-      const txt = await res.text();
-      console.warn(`[Fetch] URL returned ${ct}: ${txt.substring(0, 200)}`);
-      return null;
-    }
-
-    const ab = await res.arrayBuffer();
-    if (ab.byteLength < 500) {
-      console.warn(`[Fetch] Image too small: ${ab.byteLength} bytes`);
-      return null;
-    }
-
-    const buf = Buffer.from(ab);
-    const contentType = ct.includes('image/') ? ct : detectType(buf);
-    console.log(`[Fetch] ✅ Got image — ${buf.byteLength} bytes, ${contentType}`);
-    return { buffer: buf, contentType };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[Fetch] Failed: ${msg}`);
-    return null;
-  }
-}
-
 function clampSize(size: number): number {
   return Math.min(Math.max(Math.round(size / 8) * 8, 256), 1024);
 }
@@ -348,18 +381,18 @@ function randomSeed(): number {
 }
 
 function detectType(buf: Buffer): string {
-  if (buf[0] === 0xFF && buf[1] === 0xD8) return 'image/jpeg';
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
   if (buf[0] === 0x89 && buf[1] === 0x50) return 'image/png';
   if (buf[0] === 0x52 && buf[1] === 0x49) return 'image/webp';
   return 'image/png';
 }
 
-function logError(method: string, model: string, err: unknown): void {
+function logError(provider: string, model: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
   if (msg.includes('abort')) {
-    console.warn(`[Pollinations] ${method} ${model}: Timeout`);
+    console.warn(`[${provider}] ${model}: Timeout`);
   } else {
-    console.warn(`[Pollinations] ${method} ${model}: ${msg}`);
+    console.warn(`[${provider}] ${model}: ${msg}`);
   }
 }
 

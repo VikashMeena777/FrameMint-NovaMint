@@ -4,7 +4,7 @@
  * 10-step process producing DUAL outputs per variant:
  *   1. Create DB record
  *   2. Groq CTR engine → N variant prompts with layouts/text/colors
- *   3. Pollinations.ai image generation (per-variant params)
+ *   3. NVIDIA NIM image generation (per-variant params, Pollinations fallback)
  *   4. Post-processing (resize, color boost, sharpen)
  *   5. Text overlay rendering (SVG composite with fonts)
  *   6. Upload RAW variant to GDrive
@@ -146,7 +146,7 @@ export async function generateThumbnail(
       const variantNum = i + 1;
 
       try {
-        // ── STEP 3: Generate raw image via Pollinations.ai ──────────
+        // ── STEP 3: Generate raw image via NVIDIA NIM ──────────
         console.log(`[Pipeline] Step 3: Generating variant ${variantNum}/${ctrResult.variants.length}...`);
         const rawImage: GeneratedImage = await generateImage({
           prompt: variant.imagePrompt,
