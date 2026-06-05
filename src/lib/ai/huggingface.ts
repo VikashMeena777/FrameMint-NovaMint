@@ -5,8 +5,8 @@
  * Free tier: 40 requests/minute, no credit card required.
  *
  * Models (tried in order):
- *   1. black-forest-labs/flux.2-klein-4b  (FLUX — fast, high quality)
- *   2. stabilityai/stable-diffusion-xl     (SDXL — reliable fallback)
+ *   1. black-forest-labs/flux.2-klein-4b   (FLUX 2 — fast, high quality)
+ *   2. black-forest-labs/flux.1-schnell     (FLUX 1 — reliable fallback)
  *
  * API Key: https://build.nvidia.com → Get API Key (nvapi-...)
  * Env var: NVIDIA_NIM_API_KEY
@@ -89,32 +89,36 @@ const MODELS: ModelConfig[] = [
     },
   },
 
-  // ── FALLBACK: Stable Diffusion XL ───────────────────────────────────
-  // Uses { text_prompts: [{ text, weight }], cfg_scale, steps } format
+  // ── FALLBACK: FLUX.1-schnell ────────────────────────────────────────
+  // Same payload format as FLUX.2
   {
-    id: 'stabilityai/stable-diffusion-xl',
+    id: 'black-forest-labs/flux.1-schnell',
     buildPayload: (options) => {
-      const textPrompts: Array<{ text: string; weight: number }> = [
-        { text: options.prompt, weight: 1 },
-      ];
-      if (options.negativePrompt) {
-        textPrompts.push({ text: options.negativePrompt, weight: -1 });
-      }
       return {
-        text_prompts: textPrompts,
-        cfg_scale: options.guidanceScale ?? 5,
-        steps: options.inferenceSteps ?? 25,
+        prompt: options.prompt,
+        width: clampFluxSize(options.width),
+        height: clampFluxSize(options.height),
         seed: randomSeed(),
-        sampler: 'K_DPM_2_ANCESTRAL',
-        samples: 1,
+        steps: options.inferenceSteps ?? 4,
       };
     },
     parseResponse: (json) => {
       const body = json as Record<string, unknown>;
+
       if (body.artifacts && Array.isArray(body.artifacts)) {
         const art = body.artifacts[0] as Record<string, unknown> | undefined;
         if (art?.base64 && typeof art.base64 === 'string') return art.base64;
       }
+
+      if (body.b64_json && typeof body.b64_json === 'string') {
+        return body.b64_json;
+      }
+
+      if (body.data && Array.isArray(body.data)) {
+        const entry = body.data[0] as Record<string, unknown> | undefined;
+        if (entry?.b64_json && typeof entry.b64_json === 'string') return entry.b64_json;
+      }
+
       return null;
     },
   },
@@ -246,7 +250,7 @@ async function tryModel(
 /**
  * Generate a single image using NVIDIA NIM.
  *
- * Tries: FLUX.2-klein-4b (primary) → SDXL (fallback)
+ * Tries: FLUX.2-klein-4b (primary) → FLUX.1-schnell (fallback)
  */
 export async function generateImage(
   options: GenerateImageOptions,
