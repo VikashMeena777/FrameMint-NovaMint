@@ -55,9 +55,9 @@ const MODELS: ModelConfig[] = [
     id: 'black-forest-labs/flux.2-klein-4b',
     buildPayload: (options) => {
       const payload: Record<string, unknown> = {
-        prompt: options.prompt,
-        width: clampFluxSize(options.width),
-        height: clampFluxSize(options.height),
+        prompt: truncatePrompt(options.prompt),
+        width: snapToAllowedSize(options.width),
+        height: snapToAllowedSize(options.height),
         seed: randomSeed(),
         steps: Math.min(options.inferenceSteps ?? 4, 4),
       };
@@ -95,9 +95,9 @@ const MODELS: ModelConfig[] = [
     id: 'black-forest-labs/flux.1-schnell',
     buildPayload: (options) => {
       return {
-        prompt: options.prompt,
-        width: clampFluxSize(options.width),
-        height: clampFluxSize(options.height),
+        prompt: truncatePrompt(options.prompt),
+        width: snapToAllowedSize(options.width),
+        height: snapToAllowedSize(options.height),
         seed: randomSeed(),
         steps: Math.min(options.inferenceSteps ?? 4, 4),
       };
@@ -340,9 +340,29 @@ export async function generateMultipleImages(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Clamp to FLUX-compatible dimensions (multiple of 64, min 256, max 1440) */
-function clampFluxSize(size: number): number {
-  return Math.min(Math.max(Math.round(size / 64) * 64, 256), 1440);
+/** FLUX allowed dimensions — must be one of these exact values */
+const ALLOWED_SIZES = [768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344] as const;
+
+/** Snap a dimension to the nearest FLUX-allowed value */
+function snapToAllowedSize(size: number): number {
+  let best: number = ALLOWED_SIZES[0];
+  let bestDiff = Math.abs(size - best);
+  for (const s of ALLOWED_SIZES) {
+    const diff = Math.abs(size - s);
+    if (diff < bestDiff) {
+      best = s;
+      bestDiff = diff;
+    }
+  }
+  return best;
+}
+
+/** Truncate prompt to FLUX max of 800 characters */
+function truncatePrompt(prompt: string): string {
+  if (prompt.length <= 800) return prompt;
+  // Cut at last space before 800 to avoid breaking words
+  const cut = prompt.lastIndexOf(' ', 800);
+  return cut > 600 ? prompt.substring(0, cut) : prompt.substring(0, 800);
 }
 
 function randomSeed(): number {
