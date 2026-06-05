@@ -129,6 +129,126 @@ const slideVariants = {
   exit: { opacity: 0, x: -20, transition: { duration: 0.2 } },
 };
 
+/* ── ThumbnailResult — handles loading, retry, and display ── */
+function ThumbnailResult({
+  variant,
+  index,
+  style,
+  platform,
+  onDownload,
+}: {
+  variant: { id: string; imageUrl: string };
+  index: number;
+  style: string;
+  platform: string;
+  onDownload: (url: string, idx: number) => void;
+}) {
+  const [loaded, setLoaded] = useState(false);
+  const [errored, setErrored] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const maxRetries = 5;
+
+  // Build URL with cache-buster on retries so browser re-fetches
+  const imgSrc = retryCount > 0
+    ? `${variant.imageUrl}?t=${Date.now()}`
+    : variant.imageUrl;
+
+  const handleError = () => {
+    if (retryCount < maxRetries) {
+      // Auto-retry after 3s — GDrive needs a moment to propagate
+      setTimeout(() => {
+        setRetryCount((c) => c + 1);
+      }, 3000);
+    } else {
+      setErrored(true);
+    }
+  };
+
+  const handleManualRetry = () => {
+    setErrored(false);
+    setLoaded(false);
+    setRetryCount(0);
+  };
+
+  return (
+    <div className="group relative rounded-2xl overflow-hidden border border-white/8 bg-[var(--fm-surface)] cursor-pointer">
+      {/* Skeleton loader — shown until image loads */}
+      {!loaded && !errored && (
+        <div className="aspect-video w-full flex flex-col items-center justify-center gap-3 bg-white/[0.03]">
+          <div className="relative h-10 w-10">
+            <div className="absolute inset-0 rounded-full border-2 border-violet-500/20" />
+            <div className="absolute inset-0 rounded-full border-2 border-t-[var(--fm-primary)] animate-spin" />
+          </div>
+          <p className="text-xs text-[var(--fm-text-muted)]">
+            {retryCount > 0 ? `Loading image... (attempt ${retryCount + 1})` : 'Loading image...'}
+          </p>
+        </div>
+      )}
+
+      {/* Error state */}
+      {errored && (
+        <div className="aspect-video w-full flex flex-col items-center justify-center gap-3 bg-white/[0.03]">
+          <AlertCircle className="h-8 w-8 text-[var(--fm-text-muted)]" />
+          <p className="text-xs text-[var(--fm-text-muted)]">Image failed to load</p>
+          <button
+            onClick={handleManualRetry}
+            className="flex items-center gap-1.5 text-xs text-[var(--fm-primary-light)] hover:underline"
+          >
+            <RotateCcw className="h-3 w-3" />
+            Retry
+          </button>
+        </div>
+      )}
+
+      {/* Image — hidden until loaded */}
+      {!errored && (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          key={retryCount} // Force re-mount on retry
+          src={imgSrc}
+          alt={`Thumbnail variant ${index + 1}`}
+          className={cn(
+            'w-full h-auto object-cover transition-opacity duration-500',
+            loaded ? 'opacity-100' : 'opacity-0 absolute inset-0'
+          )}
+          onLoad={() => setLoaded(true)}
+          onError={handleError}
+        />
+      )}
+
+      {/* Overlay — only when loaded */}
+      {loaded && (
+        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/50 transition-all duration-300 flex items-center justify-center gap-3 opacity-0 group-hover:opacity-100">
+          <button
+            onClick={() => onDownload(variant.imageUrl, index)}
+            className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 backdrop-blur-sm hover:bg-white/20 transition-colors shadow-lg"
+            title="Download"
+          >
+            <Download className="h-5 w-5 text-white" />
+          </button>
+          <button
+            className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 backdrop-blur-sm hover:bg-white/20 transition-colors shadow-lg"
+            title="Favourite"
+          >
+            <Heart className="h-5 w-5 text-white" />
+          </button>
+          <button
+            className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 backdrop-blur-sm hover:bg-white/20 transition-colors shadow-lg"
+            title="Share"
+          >
+            <Share2 className="h-5 w-5 text-white" />
+          </button>
+        </div>
+      )}
+
+      {/* Variant label */}
+      <div className="absolute top-3 left-3 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-sm text-xs text-white/90 font-bold z-10">
+        V{index + 1}
+      </div>
+    </div>
+  );
+}
+
 export default function CreatePage() {
   const [step, setStep] = useState(1);
   const [prompt, setPrompt] = useState('');
@@ -531,43 +651,14 @@ export default function CreatePage() {
               {/* Thumbnails grid — 2 columns for 4 variants */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
                 {result.variants.map((variant, i) => (
-                  <div key={variant.id} className="group relative rounded-2xl overflow-hidden border border-white/8 bg-black cursor-pointer">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={variant.imageUrl}
-                      alt={`Thumbnail variant ${i + 1}`}
-                      className="w-full h-auto object-cover"
-                      loading="lazy"
-                    />
-
-                    {/* Overlay */}
-                    <div className="absolute inset-0 bg-black/0 group-hover:bg-black/50 transition-all duration-300 flex items-center justify-center gap-3 opacity-0 group-hover:opacity-100">
-                      <button
-                        onClick={() => handleDownload(variant.imageUrl, i)}
-                        className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 backdrop-blur-sm hover:bg-white/20 transition-colors shadow-lg"
-                        title="Download"
-                      >
-                        <Download className="h-5 w-5 text-white" />
-                      </button>
-                      <button
-                        className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 backdrop-blur-sm hover:bg-white/20 transition-colors shadow-lg"
-                        title="Favourite"
-                      >
-                        <Heart className="h-5 w-5 text-white" />
-                      </button>
-                      <button
-                        className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 backdrop-blur-sm hover:bg-white/20 transition-colors shadow-lg"
-                        title="Share"
-                      >
-                        <Share2 className="h-5 w-5 text-white" />
-                      </button>
-                    </div>
-
-                    {/* Variant label */}
-                    <div className="absolute top-3 left-3 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-sm text-xs text-white/90 font-bold">
-                      V{i + 1}
-                    </div>
-                  </div>
+                  <ThumbnailResult
+                    key={variant.id}
+                    variant={variant}
+                    index={i}
+                    style={style}
+                    platform={platform}
+                    onDownload={handleDownload}
+                  />
                 ))}
               </div>
 
