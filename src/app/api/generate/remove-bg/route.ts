@@ -10,7 +10,7 @@ export const maxDuration = 60;
  *
  * Note: Background removal uses HuggingFace's free REST API (no API key required
  * for the RMBG model). This is separate from the main image generation which
- * uses Pollinations.ai.
+ * uses NVIDIA NIM.
  *
  * Accepts: multipart/form-data with field "image" (file)
  * Returns: { imageUrl, format, sizeBytes }
