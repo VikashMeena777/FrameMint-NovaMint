@@ -59,7 +59,7 @@ const MODELS: ModelConfig[] = [
         width: clampFluxSize(options.width),
         height: clampFluxSize(options.height),
         seed: randomSeed(),
-        steps: options.inferenceSteps ?? 4,
+        steps: Math.min(options.inferenceSteps ?? 4, 4),
       };
       return payload;
     },
@@ -99,7 +99,7 @@ const MODELS: ModelConfig[] = [
         width: clampFluxSize(options.width),
         height: clampFluxSize(options.height),
         seed: randomSeed(),
-        steps: options.inferenceSteps ?? 4,
+        steps: Math.min(options.inferenceSteps ?? 4, 4),
       };
     },
     parseResponse: (json) => {
