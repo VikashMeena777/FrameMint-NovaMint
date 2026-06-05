@@ -5,8 +5,8 @@
  * Free tier: 40 requests/minute, no credit card required.
  *
  * Models (tried in order):
- *   1. stabilityai/stable-diffusion-xl
- *   2. stabilityai/stable-diffusion-3-5-large
+ *   1. black-forest-labs/flux.2-klein-4b  (FLUX — fast, high quality)
+ *   2. stabilityai/stable-diffusion-xl     (SDXL — reliable fallback)
  *
  * API Key: https://build.nvidia.com → Get API Key (nvapi-...)
  * Env var: NVIDIA_NIM_API_KEY
@@ -38,25 +38,87 @@ const NVIDIA_BASE_URL = 'https://ai.api.nvidia.com/v1/genai';
 const REQUEST_TIMEOUT = 120_000;
 const MAX_RETRIES = 3;
 
-/** Models tried in priority order */
-const MODELS = [
-  'stabilityai/stable-diffusion-xl',
-  'stabilityai/stable-diffusion-3-5-large',
-] as const;
-
 // ---------------------------------------------------------------------------
-// NVIDIA NIM Response types
+// Model definitions — each model has its own payload format
 // ---------------------------------------------------------------------------
 
-interface NvidiaArtifact {
-  base64?: string;
-  finishReason?: string;
-  seed?: number;
+interface ModelConfig {
+  id: string;
+  buildPayload: (options: GenerateImageOptions) => Record<string, unknown>;
+  parseResponse: (json: unknown) => string | null; // returns base64 or null
 }
 
-interface NvidiaResponse {
-  artifacts?: NvidiaArtifact[];
-}
+const MODELS: ModelConfig[] = [
+  // ── PRIMARY: FLUX.2-klein-4b ────────────────────────────────────────
+  // Uses simple { prompt, width, height, seed, steps } format
+  {
+    id: 'black-forest-labs/flux.2-klein-4b',
+    buildPayload: (options) => {
+      const payload: Record<string, unknown> = {
+        prompt: options.prompt,
+        width: clampFluxSize(options.width),
+        height: clampFluxSize(options.height),
+        seed: randomSeed(),
+        steps: options.inferenceSteps ?? 4,
+      };
+      return payload;
+    },
+    parseResponse: (json) => {
+      // FLUX returns { artifacts: [{ base64, finishReason, seed }] }
+      // OR it may return { b64_json: "..." } or { data: [{ b64_json }] }
+      const body = json as Record<string, unknown>;
+
+      // Format 1: artifacts array
+      if (body.artifacts && Array.isArray(body.artifacts)) {
+        const art = body.artifacts[0] as Record<string, unknown> | undefined;
+        if (art?.base64 && typeof art.base64 === 'string') return art.base64;
+      }
+
+      // Format 2: direct b64_json
+      if (body.b64_json && typeof body.b64_json === 'string') {
+        return body.b64_json;
+      }
+
+      // Format 3: data array (OpenAI-compatible)
+      if (body.data && Array.isArray(body.data)) {
+        const entry = body.data[0] as Record<string, unknown> | undefined;
+        if (entry?.b64_json && typeof entry.b64_json === 'string') return entry.b64_json;
+      }
+
+      return null;
+    },
+  },
+
+  // ── FALLBACK: Stable Diffusion XL ───────────────────────────────────
+  // Uses { text_prompts: [{ text, weight }], cfg_scale, steps } format
+  {
+    id: 'stabilityai/stable-diffusion-xl',
+    buildPayload: (options) => {
+      const textPrompts: Array<{ text: string; weight: number }> = [
+        { text: options.prompt, weight: 1 },
+      ];
+      if (options.negativePrompt) {
+        textPrompts.push({ text: options.negativePrompt, weight: -1 });
+      }
+      return {
+        text_prompts: textPrompts,
+        cfg_scale: options.guidanceScale ?? 5,
+        steps: options.inferenceSteps ?? 25,
+        seed: randomSeed(),
+        sampler: 'K_DPM_2_ANCESTRAL',
+        samples: 1,
+      };
+    },
+    parseResponse: (json) => {
+      const body = json as Record<string, unknown>;
+      if (body.artifacts && Array.isArray(body.artifacts)) {
+        const art = body.artifacts[0] as Record<string, unknown> | undefined;
+        if (art?.base64 && typeof art.base64 === 'string') return art.base64;
+      }
+      return null;
+    },
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Core: Generate image via NVIDIA NIM
@@ -64,32 +126,20 @@ interface NvidiaResponse {
 
 async function tryModel(
   options: GenerateImageOptions,
-  model: string,
+  model: ModelConfig,
   apiKey: string,
 ): Promise<GeneratedImage | null> {
-  const { prompt, negativePrompt, guidanceScale, inferenceSteps } = options;
-
-  // Build text_prompts array
-  const textPrompts: Array<{ text: string; weight: number }> = [
-    { text: prompt, weight: 1 },
-  ];
-  if (negativePrompt) {
-    textPrompts.push({ text: negativePrompt, weight: -1 });
-  }
-
-  const cfgScale = guidanceScale ?? 5;
-  const steps = inferenceSteps ?? 25;
-  const seed = randomSeed();
-  const url = `${NVIDIA_BASE_URL}/${model}`;
+  const payload = model.buildPayload(options);
+  const url = `${NVIDIA_BASE_URL}/${model.id}`;
 
   console.log(
-    `[NvidiaNIM] POST model="${model}" cfg=${cfgScale} steps=${steps} seed=${seed}`,
+    `[NvidiaNIM] POST model="${model.id}" payload=${JSON.stringify(payload).substring(0, 200)}`,
   );
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       console.log(
-        `[NvidiaNIM] ${model} attempt ${attempt + 1}/${MAX_RETRIES}`,
+        `[NvidiaNIM] ${model.id} attempt ${attempt + 1}/${MAX_RETRIES}`,
       );
 
       const controller = new AbortController();
@@ -102,14 +152,7 @@ async function tryModel(
           Accept: 'application/json',
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          text_prompts: textPrompts,
-          cfg_scale: cfgScale,
-          steps,
-          seed,
-          sampler: 'K_DPM_2_ANCESTRAL',
-          samples: 1,
-        }),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
       clearTimeout(timer);
@@ -118,10 +161,10 @@ async function tryModel(
       if (!res.ok) {
         const errText = await res.text().catch(() => '');
         console.warn(
-          `[NvidiaNIM] ${model} HTTP ${res.status}: ${errText.substring(0, 400)}`,
+          `[NvidiaNIM] ${model.id} HTTP ${res.status}: ${errText.substring(0, 400)}`,
         );
 
-        // Auth errors — fatal, stop trying this model
+        // Auth errors — fatal
         if ([401, 403].includes(res.status)) {
           console.error(
             `[NvidiaNIM] Auth failed (${res.status}). Check NVIDIA_NIM_API_KEY.`,
@@ -129,7 +172,7 @@ async function tryModel(
           return null;
         }
 
-        // Rate limited — respect Retry-After header
+        // Rate limited
         if (res.status === 429) {
           const wait = parseInt(res.headers.get('retry-after') || '10', 10);
           console.warn(`[NvidiaNIM] Rate limited, waiting ${wait}s...`);
@@ -137,55 +180,57 @@ async function tryModel(
           continue;
         }
 
-        // Server errors — retry after wait
+        // Server errors — retry
         if (res.status >= 500) {
           await sleep(5000);
           continue;
         }
 
-        // Other errors — skip to next model
         return null;
       }
 
-      // ── Parse JSON response ─────────────────────────────────────────
-      const json = (await res.json()) as NvidiaResponse;
-      const artifact = json?.artifacts?.[0];
+      // ── Parse response ──────────────────────────────────────────────
+      const json = await res.json();
+      const base64 = model.parseResponse(json);
 
-      if (!artifact?.base64) {
-        const reason = artifact?.finishReason || 'unknown';
+      if (!base64) {
         console.warn(
-          `[NvidiaNIM] ${model}: no base64 in response (finishReason=${reason})`,
+          `[NvidiaNIM] ${model.id}: no image data in response. Keys: ${Object.keys(json as object).join(', ')}`,
         );
 
-        // Content filtered — don't waste retries
-        if (reason === 'CONTENT_FILTERED') {
-          console.warn(`[NvidiaNIM] ${model}: prompt was flagged by safety filter`);
-          return null;
+        // Check for content filtering
+        const body = json as Record<string, unknown>;
+        if (body.artifacts && Array.isArray(body.artifacts)) {
+          const art = body.artifacts[0] as Record<string, unknown> | undefined;
+          if (art?.finishReason === 'CONTENT_FILTERED') {
+            console.warn(`[NvidiaNIM] ${model.id}: prompt flagged by safety filter`);
+            return null;
+          }
         }
 
         continue;
       }
 
       // ── Decode base64 → Buffer ──────────────────────────────────────
-      const buf = Buffer.from(artifact.base64, 'base64');
+      const buf = Buffer.from(base64, 'base64');
 
       if (buf.byteLength < 500) {
         console.warn(
-          `[NvidiaNIM] ${model}: decoded image too small (${buf.byteLength} bytes)`,
+          `[NvidiaNIM] ${model.id}: decoded image too small (${buf.byteLength} bytes)`,
         );
         continue;
       }
 
       console.log(
-        `[NvidiaNIM] ✅ ${model} success — ${buf.byteLength} bytes (seed=${artifact.seed || seed})`,
+        `[NvidiaNIM] ✅ ${model.id} success — ${buf.byteLength} bytes`,
       );
       return { buffer: buf, contentType: detectType(buf) };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('abort')) {
-        console.warn(`[NvidiaNIM] ${model}: Request timed out (${REQUEST_TIMEOUT / 1000}s)`);
+        console.warn(`[NvidiaNIM] ${model.id}: Timeout (${REQUEST_TIMEOUT / 1000}s)`);
       } else {
-        console.warn(`[NvidiaNIM] ${model}: ${msg}`);
+        console.warn(`[NvidiaNIM] ${model.id}: ${msg}`);
       }
       if (attempt < MAX_RETRIES - 1) await sleep(3000);
     }
@@ -201,7 +246,7 @@ async function tryModel(
 /**
  * Generate a single image using NVIDIA NIM.
  *
- * Tries each model in order: SDXL → SD 3.5 Large
+ * Tries: FLUX.2-klein-4b (primary) → SDXL (fallback)
  */
 export async function generateImage(
   options: GenerateImageOptions,
@@ -214,10 +259,9 @@ export async function generateImage(
         'To fix this:\n' +
         '  1. Go to https://build.nvidia.com\n' +
         '  2. Sign in and get your API key (starts with nvapi-)\n' +
-        '  3. Add it to .env.local:\n' +
-        '     NVIDIA_NIM_API_KEY=nvapi-your-key-here\n' +
-        '  4. Add it to Vercel Environment Variables\n' +
-        '  5. Restart your dev server / redeploy',
+        '  3. Add to .env.local: NVIDIA_NIM_API_KEY=nvapi-your-key\n' +
+        '  4. Add to Vercel Environment Variables\n' +
+        '  5. Restart dev server / redeploy',
     );
   }
 
@@ -231,20 +275,19 @@ export async function generateImage(
     if (result) return result;
   }
 
-  // All models failed
   throw new Error(
     'Image generation failed — all NVIDIA NIM models exhausted.\n\n' +
       'Models tried:\n' +
-      MODELS.map((m) => `  • ${m}`).join('\n') +
+      MODELS.map((m) => `  • ${m.id}`).join('\n') +
       '\n\n' +
       'Possible causes:\n' +
-      '  • NVIDIA API rate limit (40 req/min free tier)\n' +
-      '  • API key may be invalid or expired\n' +
-      '  • NVIDIA API may be experiencing issues\n\n' +
+      '  • Rate limit hit (40 req/min free tier)\n' +
+      '  • API key invalid or expired\n' +
+      '  • NVIDIA API outage\n\n' +
       'Solutions:\n' +
-      '  1. Wait 1-2 minutes and try again\n' +
+      '  1. Wait 1-2 minutes and retry\n' +
       '  2. Verify key at https://build.nvidia.com\n' +
-      '  3. Check NVIDIA_NIM_API_KEY in your .env.local',
+      '  3. Check NVIDIA_NIM_API_KEY in .env.local',
   );
 }
 
@@ -273,7 +316,6 @@ export async function generateMultipleImages(
         negativePrompt,
       });
       results.push(image);
-      // Brief pause between requests (rate-limit courtesy)
       if (i < count - 1) await sleep(2000);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -293,6 +335,11 @@ export async function generateMultipleImages(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Clamp to FLUX-compatible dimensions (multiple of 64, min 256, max 1440) */
+function clampFluxSize(size: number): number {
+  return Math.min(Math.max(Math.round(size / 64) * 64, 256), 1440);
+}
 
 function randomSeed(): number {
   return Math.floor(Math.random() * 2147483647);
